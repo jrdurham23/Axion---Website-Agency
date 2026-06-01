@@ -6,10 +6,10 @@ on:
     - cron: '0 8 * * 1'
   workflow_dispatch:
     inputs:
-      region:
-        description: 'Target region to search (e.g. Savannah, GA or 31401)'
+      zip:
+        description: 'Target ZIP code (e.g. 31401)'
         required: true
-        default: 'Savannah, GA'
+        default: '30458'
       limit:
         description: 'Max results per category'
         required: false
@@ -39,10 +39,10 @@ jobs:
         env:
           GEOAPIFY_API_KEY: ${{ secrets.GEOAPIFY_API_KEY }}
         run: |
-          REGION="${{ github.event.inputs.region || 'Savannah, GA' }}"
+          ZIP="${{ github.event.inputs.zip || '30458' }}"
           LIMIT="${{ github.event.inputs.limit || '50' }}"
           
-          python main.py --region "$REGION" --limit "$LIMIT"
+          python main.py --zip "$ZIP" --limit "$LIMIT"
           
       - name: Commit and push leads database and CSV
         run: |
