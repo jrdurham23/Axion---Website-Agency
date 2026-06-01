@@ -1,0 +1,52 @@
+name: Generate Regional Leads
+
+on:
+  schedule:
+    # Runs at 8:00 AM UTC every Monday
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'Target region to search (e.g. Savannah, GA or 31401)'
+        required: true
+        default: 'Savannah, GA'
+      limit:
+        description: 'Max results per category'
+        required: false
+        default: '50'
+
+permissions:
+  contents: write
+
+jobs:
+  run-lead-generator:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+          
+      - name: Run Lead Generator
+        env:
+          GEOAPIFY_API_KEY: ${{ secrets.GEOAPIFY_API_KEY }}
+        run: |
+          REGION="${{ github.event.inputs.region || 'Savannah, GA' }}"
+          LIMIT="${{ github.event.inputs.limit || '50' }}"
+          
+          python main.py --region "$REGION" --limit "$LIMIT"
+          
+      - name: Commit and push leads database and CSV
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f leads.csv leads.db
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update leads database and CSV" && git push)
