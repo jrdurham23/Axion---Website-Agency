@@ -103,17 +103,62 @@ def secondary_website_check(business_name: str) -> bool:
         pass
     return False
 
-def get_coordinates(api_key, region):
+def get_state_bbox_from_zip(api_key, zip_code):
     url = "https://api.geoapify.com/v1/geocode/search"
-    params = {'text': region, 'limit': 1, 'apiKey': api_key}
-    try:
-        res = requests.get(url, params=params).json()
-        if 'features' in res and len(res['features']) > 0:
-            props = res['features'][0]['properties']
-            return props.get('lon'), props.get('lat')
-    except Exception as e:
-        print(f"  Error getting coordinates for {region}: {e}")
-    return None, None
+    res = requests.get(url, params={'text': zip_code, 'limit': 1, 'apiKey': api_key}).json()
+    if 'features' not in res or not res['features']:
+        return None
+    state_name = res['features'][0]['properties'].get('state')
+    if not state_name:
+        return None
+    
+    res = requests.get(url, params={'state': state_name, 'country': 'US', 'type': 'state', 'limit': 1, 'apiKey': api_key}).json()
+    if 'features' not in res or not res['features']:
+        return None
+        
+    bbox = res['features'][0].get('bbox') # [lon1, lat1, lon2, lat2]
+    return state_name, bbox
+
+def get_counties_in_bbox(bbox):
+    import json
+    from shapely.geometry import shape, box
+    from shapely.strtree import STRtree
+    
+    if not os.path.exists("counties.json"):
+        r = requests.get("https://eric.clst.org/assets/wiki/uploads/Stuff/gz_2010_us_050_00_20m.json")
+        with open("counties.json", "w", encoding="utf-8") as f:
+            f.write(r.text)
+            
+    with open("counties.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+        
+    geometries = []
+    county_names = []
+    
+    for feature in data['features']:
+        try:
+            geom = shape(feature['geometry'])
+            geometries.append(geom)
+            county_names.append(feature['properties']['NAME'])
+        except Exception:
+            pass
+            
+    tree = STRtree(geometries)
+    minx, miny, maxx, maxy = bbox
+    state_box = box(minx, miny, maxx, maxy)
+    
+    intersecting_indices = tree.query(state_box)
+    
+    counties = []
+    for idx in intersecting_indices:
+        geom = geometries[idx]
+        name = county_names[idx]
+        c_minx, c_miny, c_maxx, c_maxy = geom.bounds
+        counties.append({
+            'name': name,
+            'bbox': [c_minx, c_miny, c_maxx, c_maxy]
+        })
+    return counties
 
 def setup_db(db_path):
     conn = sqlite3.connect(db_path)
@@ -136,7 +181,7 @@ def setup_db(db_path):
     conn.commit()
     return conn
 
-def fetch_from_geoapify(api_key, query, max_results, lon=None, lat=None):
+def fetch_from_geoapify(api_key, query, max_results, filter_str=None):
     url = "https://api.geoapify.com/v1/geocode/search"
     results = []
     
@@ -146,10 +191,8 @@ def fetch_from_geoapify(api_key, query, max_results, lon=None, lat=None):
         'apiKey': api_key
     }
     
-    if lon and lat:
-        # Filter within a 50km (~31 miles) radius
-        params['filter'] = f"circle:{lon},{lat},50000"
-        params['bias'] = f"proximity:{lon},{lat}"
+    if filter_str:
+        params['filter'] = filter_str
     
     try:
         response = requests.get(url, params=params).json()
@@ -167,7 +210,7 @@ def fetch_from_geoapify(api_key, query, max_results, lon=None, lat=None):
             
     return results[:max_results]
 
-def generate_leads(region, categories, api_key, limit=50, db_path='leads.db', csv_path='leads.csv'):
+def generate_leads(zip_code, categories, api_key, limit=50, db_path='leads.db', csv_path='leads.csv'):
     categories_list = [c.strip() for c in categories.split(',')]
     conn = setup_db(db_path)
     cursor = conn.cursor()
@@ -178,12 +221,17 @@ def generate_leads(region, categories, api_key, limit=50, db_path='leads.db', cs
     duplicates_filtered = 0
     
     console = Console()
-    console.print(f"\n[bold green][+] Geocoding region: {region}...[/bold green]")
-    lon, lat = get_coordinates(api_key, region)
-    if lon and lat:
-        console.print(f"[cyan]  Coordinates found: {lat}, {lon}. Distance filter applied (50km).[/cyan]")
-    else:
-        console.print(f"[yellow]  Could not get coordinates for region. Distance filter will not be applied.[/yellow]")
+    console.print(f"\n[bold green][+] Determining state bounds for ZIP: {zip_code}...[/bold green]")
+    state_data = get_state_bbox_from_zip(api_key, zip_code)
+    if not state_data:
+        console.print("[red]Could not determine state bounds.[/red]")
+        return
+    state_name, bbox = state_data
+    console.print(f"[cyan]  State: {state_name}, Bounds: {bbox}[/cyan]")
+    
+    console.print("[bold green][+] Building R-Tree of US Counties and querying...[/bold green]")
+    counties = get_counties_in_bbox(bbox)
+    console.print(f"[cyan]  Found {len(counties)} counties intersecting the state bounds.[/cyan]")
 
     # Setup CSV file for live appending
     file_exists = os.path.isfile(csv_path)
@@ -202,79 +250,83 @@ def generate_leads(region, categories, api_key, limit=50, db_path='leads.db', cs
 
     with Live(table, console=console, refresh_per_second=4) as live:
 
-
-        for category in categories_list:
-            query = f"{category} in {region}"
-            places = fetch_from_geoapify(api_key, query, limit, lon, lat)
+        for county in counties:
+            c_name = county['name']
+            c_bbox = county['bbox']
+            filter_str = f"rect:{c_bbox[0]},{c_bbox[1]},{c_bbox[2]},{c_bbox[3]}"
             
-            for place in places:
-                name = place.get('name', 'Unknown')
-                address = place.get('address', 'Unknown')
-                phone = place.get('phone', '')
-                website = place.get('website', None)
+            for category in categories_list:
+                query = f"{category} in {c_name} County"
+                places = fetch_from_geoapify(api_key, query, limit, filter_str)
                 
-                if is_franchise(name):
-                    franchises_filtered += 1
-                    continue
-                
-                name_lower = name.lower()
-                if name_lower in seen_names:
-                    duplicates_filtered += 1
-                    continue
-                seen_names.add(name_lower)
-                
-                if website:
-                    status, signals = analyze_website(website)
-                else:
-                    status = "none"
-                    signals = ["No website found"]
-                
-                # Secondary check if they don't have a modern site yet
-                if status in ["none", "outdated"]:
-                    if secondary_website_check(name):
-                        status = "modern"
-                        signals = ["Found official site via secondary check"]
+                for place in places:
+                    name = place.get('name', 'Unknown')
+                    address = place.get('address', 'Unknown')
+                    phone = place.get('phone', '')
+                    website = place.get('website', None)
                     
-                if status in ["none", "outdated"]:
-                    lead = {
-                        'business_name': name,
-                        'category': category,
-                        'address': address,
-                        'phone': phone,
-                        'website_url': website,
-                        'website_status': status,
-                        'outdated_signals': ", ".join(signals),
-                        'source': 'Geoapify API',
-                        'date_found': datetime.datetime.now().isoformat()
-                    }
-                    all_leads.append(lead)
+                    if is_franchise(name):
+                        franchises_filtered += 1
+                        continue
                     
-                    try:
-                        cursor.execute('''
-                            INSERT INTO leads 
-                            (business_name, category, address, phone, website_url, website_status, outdated_signals, source, date_found)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            lead['business_name'], lead['category'], lead['address'], lead['phone'],
-                            lead['website_url'], lead['website_status'], lead['outdated_signals'],
-                            lead['source'], lead['date_found']
-                        ))
-                        conn.commit()
+                    name_lower = name.lower()
+                    if name_lower in seen_names:
+                        duplicates_filtered += 1
+                        continue
+                    seen_names.add(name_lower)
+                    
+                    if website:
+                        status, signals = analyze_website(website)
+                    else:
+                        status = "none"
+                        signals = ["No website found"]
+                    
+                    # Secondary check if they don't have a modern site yet
+                    if status in ["none", "outdated"]:
+                        if secondary_website_check(name):
+                            status = "modern"
+                            signals = ["Found official site via secondary check"]
                         
-                        # Live update the CSV
-                        writer.writerow(lead)
-                        csv_file.flush()
+                    if status in ["none", "outdated"]:
+                        lead = {
+                            'business_name': name,
+                            'category': category,
+                            'address': address,
+                            'phone': phone,
+                            'website_url': website,
+                            'website_status': status,
+                            'outdated_signals': ", ".join(signals),
+                            'source': 'Geoapify API',
+                            'date_found': datetime.datetime.now().isoformat()
+                        }
+                        all_leads.append(lead)
                         
-                        # Live update the CLI table
-                        table.add_row(
-                            lead['business_name'], 
-                            lead['category'], 
-                            lead['website_status'], 
-                            lead['outdated_signals'], 
-                            lead['phone']
-                        )
-                    except sqlite3.IntegrityError:
-                        pass # Duplicate
+                        try:
+                            cursor.execute('''
+                                INSERT INTO leads 
+                                (business_name, category, address, phone, website_url, website_status, outdated_signals, source, date_found)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ''', (
+                                lead['business_name'], lead['category'], lead['address'], lead['phone'],
+                                lead['website_url'], lead['website_status'], lead['outdated_signals'],
+                                lead['source'], lead['date_found']
+                            ))
+                            conn.commit()
+                            
+                            # Live update the CSV
+                            writer.writerow(lead)
+                            csv_file.flush()
+                            
+                            # Live update the CLI table
+                            table.add_row(
+                                lead['business_name'], 
+                                lead['category'], 
+                                lead['website_status'], 
+                                lead['outdated_signals'], 
+                                lead['phone']
+                            )
+                        except sqlite3.IntegrityError:
+                            pass # Duplicate
 
     csv_file.close()
     conn.close()
