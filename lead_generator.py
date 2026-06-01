@@ -203,13 +203,13 @@ def setup_db(db_path):
     conn.commit()
     return conn
 
-def fetch_from_geoapify(api_key, query, max_results, filter_str=None):
-    url = "https://api.geoapify.com/v1/geocode/search"
+def fetch_from_geoapify(api_key, filter_str=None):
+    url = "https://api.geoapify.com/v2/places"
     results = []
     
     params = {
-        'text': query,
-        'limit': min(max_results, 50),
+        'categories': 'commercial,catering,service',
+        'limit': 500,
         'apiKey': api_key
     }
     
@@ -228,12 +228,13 @@ def fetch_from_geoapify(api_key, query, max_results, filter_str=None):
                     'name': props.get('name', props.get('address_line1', 'Unknown')),
                     'address': props.get('formatted', 'Unknown'),
                     'phone': props.get('contact', {}).get('phone', ''),
-                    'website': props.get('website', None)
+                    'website': props.get('website', None),
+                    'raw_categories': props.get('categories', [])
                 })
     except Exception as e:
-        print(f"  Error fetching from Geoapify: {e}")
+        pass
             
-    return results[:max_results]
+    return results
 
 def generate_leads(zip_code, categories, api_key, limit=50, db_path='leads.db', csv_path='leads.csv'):
     categories_list = [c.strip() for c in categories.split(',')]
@@ -279,16 +280,29 @@ def generate_leads(zip_code, categories, api_key, limit=50, db_path='leads.db', 
     db_lock = Lock()
     seen_lock = Lock()
     
-    def process_county_category(county, category):
+    def process_county(county):
         c_name = county['name']
         c_bbox = county['bbox']
         filter_str = f"rect:{c_bbox[0]},{c_bbox[1]},{c_bbox[2]},{c_bbox[3]}"
-        query = f"{category} in {c_name} County"
         
-        places = fetch_from_geoapify(api_key, query, limit, filter_str)
+        # Batching: We fetch ALL relevant places in this county in a single API call
+        places = fetch_from_geoapify(api_key, filter_str)
         
         for place in places:
             name = place.get('name', 'Unknown')
+            name_lower = name.lower()
+            raw_cats = str(place.get('raw_categories', [])).lower()
+            
+            # Map to user's requested categories
+            matched_category = None
+            for tc in categories_list:
+                if tc.lower() in name_lower or tc.lower() in raw_cats:
+                    matched_category = tc
+                    break
+                    
+            if not matched_category:
+                continue
+                
             address = place.get('address', 'Unknown')
             phone = place.get('phone', '')
             website = place.get('website', None)
@@ -298,7 +312,6 @@ def generate_leads(zip_code, categories, api_key, limit=50, db_path='leads.db', 
                     franchises_filtered_count[0] += 1
                 continue
             
-            name_lower = name.lower()
             with seen_lock:
                 if name_lower in seen_names:
                     duplicates_filtered_count[0] += 1
@@ -319,13 +332,13 @@ def generate_leads(zip_code, categories, api_key, limit=50, db_path='leads.db', 
             if status in ["none", "outdated"]:
                 lead = {
                     'business_name': name,
-                    'category': category,
+                    'category': matched_category,
                     'address': address,
                     'phone': phone,
                     'website_url': website,
                     'website_status': status,
                     'outdated_signals': ", ".join(signals),
-                    'source': 'Geoapify API',
+                    'source': 'Geoapify API (Batched)',
                     'date_found': datetime.datetime.now().isoformat()
                 }
                 
@@ -356,8 +369,7 @@ def generate_leads(zip_code, categories, api_key, limit=50, db_path='leads.db', 
 
     tasks = []
     for county in counties:
-        for category in categories_list:
-            tasks.append((county, category))
+        tasks.append(county)
 
     progress = Progress(
         SpinnerColumn(),
@@ -366,7 +378,7 @@ def generate_leads(zip_code, categories, api_key, limit=50, db_path='leads.db', 
         TaskProgressColumn(),
         TimeRemainingColumn()
     )
-    task_id = progress.add_task("[cyan]Scanning categories across counties...", total=len(tasks))
+    task_id = progress.add_task("[cyan]Scanning counties (Batched API calls)...", total=len(tasks))
 
     group = Group(
         progress,
@@ -374,9 +386,9 @@ def generate_leads(zip_code, categories, api_key, limit=50, db_path='leads.db', 
     )
 
     with Live(group, console=console, refresh_per_second=4) as live:
-        # 5 max workers prevents hitting Geoapify 5 req/sec limit
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(process_county_category, t[0], t[1]) for t in tasks]
+        # Increased to 25 workers to maximize your bandwidth. Rate limits will be caught by our backoff logic.
+        with ThreadPoolExecutor(max_workers=25) as executor:
+            futures = [executor.submit(process_county, t) for t in tasks]
             for future in as_completed(futures):
                 try:
                     future.result()
