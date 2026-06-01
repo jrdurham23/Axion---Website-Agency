@@ -7,9 +7,13 @@ import csv
 import time
 import os
 import urllib3
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+from rich.console import Group
 
 
 # Suppress insecure request warnings for bad SSL certs on outdated sites
@@ -20,6 +24,21 @@ from blocklist import FRANCHISE_BLOCKLIST
 def is_franchise(business_name: str) -> bool:
     name_lower = business_name.lower()
     return any(term in name_lower for term in FRANCHISE_BLOCKLIST)
+
+
+def robust_request(url, params=None, headers=None, max_retries=3, **kwargs):
+    import time
+    import requests
+    for attempt in range(max_retries):
+        try:
+            res = requests.get(url, params=params, headers=headers, timeout=15, **kwargs)
+            if res.status_code == 429:
+                time.sleep(2 ** attempt)
+                continue
+            return res
+        except Exception as e:
+            time.sleep(2)
+    return None
 
 def analyze_website(url):
     """
@@ -33,7 +52,9 @@ def analyze_website(url):
         # Some websites block requests without a proper User-Agent
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         # Many old sites don't have valid SSL certificates
-        res = requests.get(url, timeout=10, headers=headers, verify=False)
+        res = robust_request(url, headers=headers, verify=False)
+        if not res:
+            return 'error', ['connection failed']
         
         if res.status_code >= 400:
             return "error", [f"HTTP error {res.status_code}"]
@@ -85,7 +106,8 @@ def secondary_website_check(business_name: str) -> bool:
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     data = {'q': query}
     try:
-        res = requests.post(url, data=data, headers=headers, timeout=5)
+        time.sleep(1)
+        res = requests.post(url, data=data, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
         results = soup.find_all('a', class_='result__url', limit=5)
         
@@ -195,7 +217,10 @@ def fetch_from_geoapify(api_key, query, max_results, filter_str=None):
         params['filter'] = filter_str
     
     try:
-        response = requests.get(url, params=params).json()
+        res = robust_request(url, params=params)
+        if not res:
+            return []
+        response = res.json()
         if 'features' in response:
             for feature in response['features']:
                 props = feature.get('properties', {})
@@ -241,92 +266,123 @@ def generate_leads(zip_code, categories, api_key, limit=50, db_path='leads.db', 
     if not file_exists:
         writer.writeheader()
 
-    table = Table(title=f"Leads Found in {region}", show_lines=True)
+    table = Table(title=f"Leads Found in {zip_code}", show_lines=True)
     table.add_column("Business Name", style="cyan")
     table.add_column("Category", style="magenta")
     table.add_column("Status", style="green")
     table.add_column("Signals", style="yellow")
     table.add_column("Phone")
 
-    with Live(table, console=console, refresh_per_second=4) as live:
-
-        for county in counties:
-            c_name = county['name']
-            c_bbox = county['bbox']
-            filter_str = f"rect:{c_bbox[0]},{c_bbox[1]},{c_bbox[2]},{c_bbox[3]}"
+    franchises_filtered_count = [0]
+    duplicates_filtered_count = [0]
+    
+    db_lock = Lock()
+    seen_lock = Lock()
+    
+    def process_county_category(county, category):
+        c_name = county['name']
+        c_bbox = county['bbox']
+        filter_str = f"rect:{c_bbox[0]},{c_bbox[1]},{c_bbox[2]},{c_bbox[3]}"
+        query = f"{category} in {c_name} County"
+        
+        places = fetch_from_geoapify(api_key, query, limit, filter_str)
+        
+        for place in places:
+            name = place.get('name', 'Unknown')
+            address = place.get('address', 'Unknown')
+            phone = place.get('phone', '')
+            website = place.get('website', None)
             
-            for category in categories_list:
-                query = f"{category} in {c_name} County"
-                places = fetch_from_geoapify(api_key, query, limit, filter_str)
+            if is_franchise(name):
+                with seen_lock:
+                    franchises_filtered_count[0] += 1
+                continue
+            
+            name_lower = name.lower()
+            with seen_lock:
+                if name_lower in seen_names:
+                    duplicates_filtered_count[0] += 1
+                    continue
+                seen_names.add(name_lower)
+            
+            if website:
+                status, signals = analyze_website(website)
+            else:
+                status = "none"
+                signals = ["No website found"]
+            
+            if status in ["none", "outdated"]:
+                if secondary_website_check(name):
+                    status = "modern"
+                    signals = ["Found official site via secondary check"]
                 
-                for place in places:
-                    name = place.get('name', 'Unknown')
-                    address = place.get('address', 'Unknown')
-                    phone = place.get('phone', '')
-                    website = place.get('website', None)
-                    
-                    if is_franchise(name):
-                        franchises_filtered += 1
-                        continue
-                    
-                    name_lower = name.lower()
-                    if name_lower in seen_names:
-                        duplicates_filtered += 1
-                        continue
-                    seen_names.add(name_lower)
-                    
-                    if website:
-                        status, signals = analyze_website(website)
-                    else:
-                        status = "none"
-                        signals = ["No website found"]
-                    
-                    # Secondary check if they don't have a modern site yet
-                    if status in ["none", "outdated"]:
-                        if secondary_website_check(name):
-                            status = "modern"
-                            signals = ["Found official site via secondary check"]
-                        
-                    if status in ["none", "outdated"]:
-                        lead = {
-                            'business_name': name,
-                            'category': category,
-                            'address': address,
-                            'phone': phone,
-                            'website_url': website,
-                            'website_status': status,
-                            'outdated_signals': ", ".join(signals),
-                            'source': 'Geoapify API',
-                            'date_found': datetime.datetime.now().isoformat()
-                        }
-                        all_leads.append(lead)
-                        
-                        try:
-                            cursor.execute('''
-                                INSERT INTO leads 
-                                (business_name, category, address, phone, website_url, website_status, outdated_signals, source, date_found)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ''', (
-                                lead['business_name'], lead['category'], lead['address'], lead['phone'],
-                                lead['website_url'], lead['website_status'], lead['outdated_signals'],
-                                lead['source'], lead['date_found']
-                            ))
-                            conn.commit()
-                            
-                            # Live update the CSV
-                            writer.writerow(lead)
-                            csv_file.flush()
-                            
-                            # Live update the CLI table
-                            table.add_row(
-                                lead['business_name'], 
-                                lead['category'], 
-                                lead['website_status'], 
-                                lead['outdated_signals'], 
-                                lead['phone']
-                            )
-                        except sqlite3.IntegrityError:
-                            pass # Duplicate
+            if status in ["none", "outdated"]:
+                lead = {
+                    'business_name': name,
+                    'category': category,
+                    'address': address,
+                    'phone': phone,
+                    'website_url': website,
+                    'website_status': status,
+                    'outdated_signals': ", ".join(signals),
+                    'source': 'Geoapify API',
+                    'date_found': datetime.datetime.now().isoformat()
+                }
+                
+                with db_lock:
+                    all_leads.append(lead)
+                    try:
+                        cursor.execute('''
+                            INSERT INTO leads 
+                            (business_name, category, address, phone, website_url, website_status, outdated_signals, source, date_found)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            lead['business_name'], lead['category'], lead['address'], lead['phone'],
+                            lead['website_url'], lead['website_status'], lead['outdated_signals'],
+                            lead['source'], lead['date_found']
+                        ))
+                        conn.commit()
+                        writer.writerow(lead)
+                        csv_file.flush()
+                        table.add_row(
+                            lead['business_name'], 
+                            lead['category'], 
+                            lead['website_status'], 
+                            lead['outdated_signals'], 
+                            lead['phone']
+                        )
+                    except sqlite3.IntegrityError:
+                        pass
+
+    tasks = []
+    for county in counties:
+        for category in categories_list:
+            tasks.append((county, category))
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn()
+    )
+    task_id = progress.add_task("[cyan]Scanning categories across counties...", total=len(tasks))
+
+    group = Group(
+        progress,
+        table
+    )
+
+    with Live(group, console=console, refresh_per_second=4) as live:
+        # 5 max workers prevents hitting Geoapify 5 req/sec limit
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(process_county_category, t[0], t[1]) for t in tasks]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    pass
+                progress.advance(task_id)
 
     csv_file.close()
     conn.close()
@@ -336,5 +392,5 @@ def generate_leads(zip_code, categories, api_key, limit=50, db_path='leads.db', 
     else:
         console.print("\n[bold yellow][-] No qualified leads found in this run.[/bold yellow]")
         
-    console.print(f"[bold cyan][+] Filtered: {franchises_filtered} franchises, {duplicates_filtered} duplicates. Net leads: {len(all_leads)}[/bold cyan]")
+    console.print(f"[bold cyan][+] Filtered: {franchises_filtered_count[0]} franchises, {duplicates_filtered_count[0]} duplicates. Net leads: {len(all_leads)}[/bold cyan]")
 
